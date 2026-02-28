@@ -8,17 +8,35 @@ dotenv.config();
 
 const app = express();
 
-// CORS Configuration
-const allowedOrigins = [
-  'http://localhost:3000',
-  'http://localhost:5000',
-  process.env.FRONTEND_URL || 'https://your-frontend.vercel.app'
-];
-
-app.use(cors({
-  origin: allowedOrigins,
+// CORS Configuration - Dynamic to handle Vercel URL changes
+const corsOptions = {
+  origin: function (origin, callback) {
+    const allowedPatterns = [
+      'http://localhost:3000',
+      'http://localhost:5000',
+      'http://127.0.0.1:3000',
+      /vercel\.app$/,  // Allow any vercel.app subdomain
+      /onrender\.com$/ // Allow any onrender.com subdomain
+    ];
+    
+    // Allow requests with no origin (like curl, mobile apps, Postman)
+    if (!origin) return callback(null, true);
+    
+    const isAllowed = allowedPatterns.some(pattern => {
+      if (typeof pattern === 'string') return origin === pattern;
+      return pattern.test(origin);
+    });
+    
+    if (isAllowed) {
+      callback(null, true);
+    } else {
+      callback(new Error('CORS not allowed'));
+    }
+  },
   credentials: true
-}));
+};
+
+app.use(cors(corsOptions));
 
 // Middleware
 app.use(bodyParser.json({ limit: '50mb' }));
