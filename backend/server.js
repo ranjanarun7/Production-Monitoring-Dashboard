@@ -8,8 +8,19 @@ dotenv.config();
 
 const app = express();
 
+// CORS Configuration
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:5000',
+  process.env.FRONTEND_URL || 'https://your-frontend.vercel.app'
+];
+
+app.use(cors({
+  origin: allowedOrigins,
+  credentials: true
+}));
+
 // Middleware
-app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
@@ -24,10 +35,10 @@ mongoose.connect(MONGODB_URI, {
   .catch(err => console.error('MongoDB connection error:', err));
 
 // Routes
-app.use('/api/events', require('./routes/eventRoutes'));
-app.use('/api/workers', require('./routes/workerRoutes'));
-app.use('/api/workstations', require('./routes/workstationRoutes'));
-app.use('/api/metrics', require('./routes/metricsRoutes'));
+app.use('/api/events', require('./src/routes/eventRoutes'));
+app.use('/api/workers', require('./src/routes/workerRoutes'));
+app.use('/api/workstations', require('./src/routes/workstationRoutes'));
+app.use('/api/metrics', require('./src/routes/metricsRoutes'));
 
 // Health check endpoint
 app.get('/health', (req, res) => {
