@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import FactorySummary from '../components/FactorySummary';
 import WorkersSection from '../components/WorkersSection';
 import WorkstationsSection from '../components/WorkstationsSection';
@@ -18,6 +18,9 @@ const Dashboard = () => {
     end: new Date()
   });
 
+  // OPTIMIZATION: Debounce timer to prevent excessive API calls on date range changes
+  const debounceTimer = useRef(null);
+
   // Helper function to properly parse datetime-local input
   const parseLocalDateTime = (dateString) => {
     // datetime-local format: "2026-01-15T14:30"
@@ -28,22 +31,22 @@ const Dashboard = () => {
     return new Date(year, month - 1, day, hours, minutes);
   };
 
-  const loadData = useCallback(async () => {
+  const loadData = useCallback(async (startDate, endDate) => {
     try {
       setLoading(true);
       setError(null);
 
-      // Use the current dateRange values directly
-      const startDate = dateRange.start.toISOString();
-      const endDate = dateRange.end.toISOString();
+      const startISO = startDate.toISOString();
+      const endISO = endDate.toISOString();
 
-      // Load all data in parallel
+      // OPTIMIZATION: Load all data in parallel for better performance
+      // Workers and Workstations data is relatively static, so they could be cached separately
       const [workersRes, stationsRes, factoryRes, workerMetricsRes, stationMetricsRes] = await Promise.all([
         workerService.getAll(),
         workstationService.getAll(),
-        metricsService.getFactoryMetrics(startDate, endDate),
-        metricsService.getAllWorkerMetrics(startDate, endDate),
-        metricsService.getAllWorkstationMetrics(startDate, endDate)
+        metricsService.getFactoryMetrics(startISO, endISO),
+        metricsService.getAllWorkerMetrics(startISO, endISO),
+        metricsService.getAllWorkstationMetrics(startISO, endISO)
       ]);
 
       setWorkers(workersRes.data);
@@ -57,7 +60,24 @@ const Dashboard = () => {
     } finally {
       setLoading(false);
     }
-  }, [dateRange]);
+  }, []);
+
+  // OPTIMIZATION: Debounce date range changes to avoid excessive API calls
+  useEffect(() => {
+    if (debounceTimer.current) {
+      clearTimeout(debounceTimer.current);
+    }
+    
+    debounceTimer.current = setTimeout(() => {
+      loadData(dateRange.start, dateRange.end);
+    }, 800); // Wait 800ms after last date change before fetching
+
+    return () => {
+      if (debounceTimer.current) {
+        clearTimeout(debounceTimer.current);
+      }
+    };
+  }, [dateRange, loadData]);
 
   const seedData = async () => {
     try {
@@ -85,9 +105,10 @@ const Dashboard = () => {
     }
   };
 
-  useEffect(() => {
-    loadData();
-  }, [loadData]);
+  // Manual refresh (doesn't use debounce)
+  const handleRefresh = () => {
+    loadData(dateRange.start, dateRange.end);
+  };
 
   return (
     <div className="dashboard">
@@ -98,7 +119,7 @@ const Dashboard = () => {
 
       <div className="container">
         <Controls 
-          onRefresh={loadData} 
+          onRefresh={handleRefresh} 
           onSeedData={seedData}
           isLoading={loading}
         />

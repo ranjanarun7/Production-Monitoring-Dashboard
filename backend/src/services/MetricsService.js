@@ -1,8 +1,29 @@
 const Event = require('../models/Event');
 
+// In-memory cache for metrics (5 minute TTL)
+const metricsCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000;
+
+function getCacheKey(type, id, startDate, endDate) {
+  return `${type}:${id}:${startDate.getTime()}:${endDate.getTime()}`;
+}
+
+function getCachedMetrics(key) {
+  const cached = metricsCache.get(key);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    return cached.data;
+  }
+  metricsCache.delete(key);
+  return null;
+}
+
+function setCachedMetrics(key, data) {
+  metricsCache.set(key, { data, timestamp: Date.now() });
+}
+
 class MetricsService {
   /**
-   * Get worker metrics
+   * Get worker metrics using optimized aggregation pipeline
    * Assumptions:
    * - Each "working" event is counted as active time (1 unit = 1 minute by default)
    * - "idle" events represent downtime
@@ -10,50 +31,108 @@ class MetricsService {
    * - Utilization % = active_time / (active_time + idle_time) * 100
    */
   static async getWorkerMetrics(workerId, startDate, endDate) {
-    const events = await Event.find({
-      worker_id: workerId,
-      timestamp: { $gte: startDate, $lte: endDate },
-      event_type: { $in: ['working', 'idle', 'product_count'] }
-    }).sort({ timestamp: 1 });
+    const cacheKey = getCacheKey('worker', workerId, startDate, endDate);
+    const cached = getCachedMetrics(cacheKey);
+    if (cached) return cached;
 
-    let totalActiveTime = 0;
-    let totalIdleTime = 0;
-    let totalUnitsProduced = 0;
-    let workingEvents = 0;
-    let idleEvents = 0;
-
-    events.forEach((event) => {
-      if (event.event_type === 'working') {
-        totalActiveTime += event.duration || 1; // 1 unit = 1 minute
-        workingEvents++;
-      } else if (event.event_type === 'idle') {
-        totalIdleTime += event.duration || 1;
-        idleEvents++;
-      } else if (event.event_type === 'product_count') {
-        totalUnitsProduced += event.count || 0;
+    const results = await Event.aggregate([
+      {
+        $match: {
+          worker_id: workerId,
+          timestamp: { $gte: startDate, $lte: endDate },
+          event_type: { $in: ['working', 'idle', 'product_count'] }
+        }
+      },
+      {
+        $group: {
+          _id: '$worker_id',
+          total_active_time: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'working'] }, { $ifNull: ['$duration', 1] }, 0]
+            }
+          },
+          total_idle_time: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'idle'] }, { $ifNull: ['$duration', 1] }, 0]
+            }
+          },
+          total_units_produced: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'product_count'] }, { $ifNull: ['$count', 0] }, 0]
+            }
+          },
+          working_events_count: {
+            $sum: { $cond: [{ $eq: ['$event_type', 'working'] }, 1, 0] }
+          },
+          idle_events_count: {
+            $sum: { $cond: [{ $eq: ['$event_type', 'idle'] }, 1, 0] }
+          },
+          avg_confidence: { $avg: '$confidence' }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          worker_id: '$_id',
+          total_active_time_minutes: '$total_active_time',
+          total_idle_time_minutes: '$total_idle_time',
+          total_time_minutes: { $add: ['$total_active_time', '$total_idle_time'] },
+          total_units_produced: '$total_units_produced',
+          working_events_count: '$working_events_count',
+          idle_events_count: '$idle_events_count',
+          utilization_percentage: {
+            $cond: [
+              { $gt: [{ $add: ['$total_active_time', '$total_idle_time'] }, 0] },
+              {
+                $round: [
+                  {
+                    $multiply: [
+                      { $divide: ['$total_active_time', { $add: ['$total_active_time', '$total_idle_time'] }] },
+                      100
+                    ]
+                  },
+                  2
+                ]
+              },
+              0
+            ]
+          },
+          units_per_hour: {
+            $cond: [
+              { $gt: ['$total_active_time', 0] },
+              {
+                $round: [
+                  { $divide: ['$total_units_produced', { $divide: ['$total_active_time', 60] }] },
+                  2
+                ]
+              },
+              0
+            ]
+          },
+          average_confidence: { $round: ['$avg_confidence', 3] }
+        }
       }
-    });
+    ]);
 
-    const totalTime = totalActiveTime + totalIdleTime;
-    const utilizationPercentage = totalTime > 0 ? (totalActiveTime / totalTime) * 100 : 0;
-    const unitsPerHour = totalActiveTime > 0 ? (totalUnitsProduced / (totalActiveTime / 60)) : 0;
-
-    return {
+    const metrics = results.length > 0 ? results[0] : {
       worker_id: workerId,
-      total_active_time_minutes: totalActiveTime,
-      total_idle_time_minutes: totalIdleTime,
-      total_time_minutes: totalTime,
-      utilization_percentage: parseFloat(utilizationPercentage.toFixed(2)),
-      total_units_produced: totalUnitsProduced,
-      units_per_hour: parseFloat(unitsPerHour.toFixed(2)),
-      working_events_count: workingEvents,
-      idle_events_count: idleEvents,
-      average_confidence: await this.getAverageConfidence(workerId, startDate, endDate)
+      total_active_time_minutes: 0,
+      total_idle_time_minutes: 0,
+      total_time_minutes: 0,
+      utilization_percentage: 0,
+      total_units_produced: 0,
+      units_per_hour: 0,
+      working_events_count: 0,
+      idle_events_count: 0,
+      average_confidence: 0
     };
+
+    setCachedMetrics(cacheKey, metrics);
+    return metrics;
   }
 
   /**
-   * Get workstation metrics
+   * Get workstation metrics using optimized aggregation pipeline
    * Assumptions:
    * - Occupancy time = sum of all "working" events at the station
    * - Utilization % = occupancy_time / total_available_time * 100 (assuming 8-12 hours per day)
@@ -61,50 +140,107 @@ class MetricsService {
    * - Throughput rate = units per hour of operation
    */
   static async getWorkstationMetrics(stationId, startDate, endDate) {
-    const events = await Event.find({
-      workstation_id: stationId,
-      timestamp: { $gte: startDate, $lte: endDate },
-      event_type: { $in: ['working', 'idle', 'product_count'] }
-    }).sort({ timestamp: 1 });
+    const cacheKey = getCacheKey('station', stationId, startDate, endDate);
+    const cached = getCachedMetrics(cacheKey);
+    if (cached) return cached;
 
-    let totalOccupancyTime = 0;
-    let totalIdleTime = 0;
-    let totalUnitsProduced = 0;
-    let workingEvents = 0;
-    let uniqueWorkers = new Set();
-
-    events.forEach((event) => {
-      if (event.event_type === 'working') {
-        totalOccupancyTime += event.duration || 1;
-        workingEvents++;
-        uniqueWorkers.add(event.worker_id);
-      } else if (event.event_type === 'idle') {
-        totalIdleTime += event.duration || 1;
-      } else if (event.event_type === 'product_count') {
-        totalUnitsProduced += event.count || 0;
+    const results = await Event.aggregate([
+      {
+        $match: {
+          workstation_id: stationId,
+          timestamp: { $gte: startDate, $lte: endDate },
+          event_type: { $in: ['working', 'idle', 'product_count'] }
+        }
+      },
+      {
+        $group: {
+          _id: '$workstation_id',
+          occupancy_time: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'working'] }, { $ifNull: ['$duration', 1] }, 0]
+            }
+          },
+          idle_time: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'idle'] }, { $ifNull: ['$duration', 1] }, 0]
+            }
+          },
+          total_units_produced: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'product_count'] }, { $ifNull: ['$count', 0] }, 0]
+            }
+          },
+          working_events_count: {
+            $sum: { $cond: [{ $eq: ['$event_type', 'working'] }, 1, 0] }
+          },
+          unique_workers: { $addToSet: '$worker_id' },
+          avg_confidence: { $avg: '$confidence' }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          station_id: '$_id',
+          occupancy_time_minutes: '$occupancy_time',
+          idle_time_minutes: '$idle_time',
+          total_time_minutes: { $add: ['$occupancy_time', '$idle_time'] },
+          total_units_produced: '$total_units_produced',
+          working_events_count: '$working_events_count',
+          unique_workers: { $size: '$unique_workers' },
+          utilization_percentage: {
+            $cond: [
+              { $gt: [{ $add: ['$occupancy_time', '$idle_time'] }, 0] },
+              {
+                $round: [
+                  {
+                    $multiply: [
+                      { $divide: ['$occupancy_time', { $add: ['$occupancy_time', '$idle_time'] }] },
+                      100
+                    ]
+                  },
+                  2
+                ]
+              },
+              0
+            ]
+          },
+          throughput_rate_units_per_hour: {
+            $cond: [
+              { $gt: ['$occupancy_time', 0] },
+              {
+                $round: [
+                  { $divide: ['$total_units_produced', { $divide: ['$occupancy_time', 60] }] },
+                  2
+                ]
+              },
+              0
+            ]
+          },
+          average_confidence: { $round: ['$avg_confidence', 3] }
+        }
       }
-    });
+    ]);
 
-    const totalTime = totalOccupancyTime + totalIdleTime;
-    const utilizationPercentage = totalTime > 0 ? (totalOccupancyTime / totalTime) * 100 : 0;
-    const throughputRate = totalOccupancyTime > 0 ? (totalUnitsProduced / (totalOccupancyTime / 60)) : 0;
-
-    return {
+    const metrics = results.length > 0 ? results[0] : {
       station_id: stationId,
-      occupancy_time_minutes: totalOccupancyTime,
-      idle_time_minutes: totalIdleTime,
-      total_time_minutes: totalTime,
-      utilization_percentage: parseFloat(utilizationPercentage.toFixed(2)),
-      total_units_produced: totalUnitsProduced,
-      throughput_rate_units_per_hour: parseFloat(throughputRate.toFixed(2)),
-      working_events_count: workingEvents,
-      unique_workers: uniqueWorkers.size,
-      average_confidence: await this.getAverageConfidenceStation(stationId, startDate, endDate)
+      occupancy_time_minutes: 0,
+      idle_time_minutes: 0,
+      total_time_minutes: 0,
+      utilization_percentage: 0,
+      total_units_produced: 0,
+      throughput_rate_units_per_hour: 0,
+      working_events_count: 0,
+      unique_workers: 0,
+      average_confidence: 0
     };
+
+    setCachedMetrics(cacheKey, metrics);
+    return metrics;
   }
 
   /**
-   * Get factory-level metrics
+   * Get factory-level metrics using optimized aggregation pipeline
+   * Avoids N+1 problem by calculating all metrics in single pass
    * Assumptions:
    * - Total productive time = sum of all "working" events across all workers
    * - Total production count = sum of all "product_count" events
@@ -112,107 +248,314 @@ class MetricsService {
    * - Average utilization = avg of all worker utilization percentages
    */
   static async getFactoryMetrics(startDate, endDate) {
-    const allEvents = await Event.find({
-      timestamp: { $gte: startDate, $lte: endDate },
-      event_type: { $in: ['working', 'idle', 'product_count'] }
-    });
+    const cacheKey = getCacheKey('factory', 'all', startDate, endDate);
+    const cached = getCachedMetrics(cacheKey);
+    if (cached) return cached;
 
-    let totalProductiveTime = 0;
-    let totalIdleTime = 0;
-    let totalProduction = 0;
-    const workerMetricsMap = new Map();
-    const stationMetricsMap = new Map();
-
-    // Aggregate data
-    allEvents.forEach((event) => {
-      if (event.event_type === 'working') {
-        totalProductiveTime += event.duration || 1;
-      } else if (event.event_type === 'idle') {
-        totalIdleTime += event.duration || 1;
-      } else if (event.event_type === 'product_count') {
-        totalProduction += event.count || 0;
+    // Get all worker metrics in one pass
+    const workerAggregation = await Event.aggregate([
+      {
+        $match: {
+          timestamp: { $gte: startDate, $lte: endDate },
+          event_type: { $in: ['working', 'idle', 'product_count'] }
+        }
+      },
+      {
+        $group: {
+          _id: '$worker_id',
+          active_time: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'working'] }, { $ifNull: ['$duration', 1] }, 0]
+            }
+          },
+          idle_time: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'idle'] }, { $ifNull: ['$duration', 1] }, 0]
+            }
+          }
+        }
+      },
+      {
+        $project: {
+          _id: 1,
+          total_time: { $add: ['$active_time', '$idle_time'] },
+          utilization: {
+            $cond: [
+              { $gt: [{ $add: ['$active_time', '$idle_time'] }, 0] },
+              { $divide: ['$active_time', { $add: ['$active_time', '$idle_time'] }] },
+              0
+            ]
+          }
+        }
       }
-    });
+    ]);
 
-    // Get all unique workers and their utilization
-    const uniqueWorkers = new Set();
-    const uniqueStations = new Set();
-    let totalUtilization = 0;
-    let workerCount = 0;
+    // Calculate factory-level aggregates
+    const factoryAgg = await Event.aggregate([
+      {
+        $match: {
+          timestamp: { $gte: startDate, $lte: endDate },
+          event_type: { $in: ['working', 'idle', 'product_count'] }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          total_productive_time: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'working'] }, { $ifNull: ['$duration', 1] }, 0]
+            }
+          },
+          total_idle_time: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'idle'] }, { $ifNull: ['$duration', 1] }, 0]
+            }
+          },
+          total_production: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'product_count'] }, { $ifNull: ['$count', 0] }, 0]
+            }
+          },
+          unique_workers: { $addToSet: '$worker_id' },
+          unique_stations: { $addToSet: '$workstation_id' },
+          total_events: { $sum: 1 }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          total_productive_time_minutes: '$total_productive_time',
+          total_idle_time_minutes: '$total_idle_time',
+          total_time_minutes: { $add: ['$total_productive_time', '$total_idle_time'] },
+          total_production_count: '$total_production',
+          active_workers: { $size: '$unique_workers' },
+          active_stations: { $size: '$unique_stations' },
+          total_events: '$total_events',
+          factory_utilization_percentage: {
+            $cond: [
+              { $gt: [{ $add: ['$total_productive_time', '$total_idle_time'] }, 0] },
+              {
+                $round: [
+                  {
+                    $multiply: [
+                      { $divide: ['$total_productive_time', { $add: ['$total_productive_time', '$total_idle_time'] }] },
+                      100
+                    ]
+                  },
+                  2
+                ]
+              },
+              0
+            ]
+          },
+          average_production_rate_units_per_hour: {
+            $cond: [
+              { $gt: ['$total_productive_time', 0] },
+              {
+                $round: [
+                  { $divide: ['$total_production', { $divide: ['$total_productive_time', 60] }] },
+                  2
+                ]
+              },
+              0
+            ]
+          }
+        }
+      }
+    ]);
 
-    allEvents.forEach((event) => {
-      uniqueWorkers.add(event.worker_id);
-      uniqueStations.add(event.workstation_id);
-    });
+    let result = factoryAgg.length > 0 ? factoryAgg[0] : {
+      total_productive_time_minutes: 0,
+      total_idle_time_minutes: 0,
+      total_time_minutes: 0,
+      total_production_count: 0,
+      average_production_rate_units_per_hour: 0,
+      factory_utilization_percentage: 0,
+      active_workers: 0,
+      active_stations: 0,
+      total_events: 0
+    };
 
-    // Calculate average utilization
-    for (const workerId of uniqueWorkers) {
-      const metrics = await this.getWorkerMetrics(workerId, startDate, endDate);
-      totalUtilization += metrics.utilization_percentage;
-      workerCount++;
+    // Calculate average utilization from worker metrics
+    if (workerAggregation.length > 0) {
+      const avgUtil = workerAggregation.reduce((sum, w) => sum + w.utilization, 0) / workerAggregation.length * 100;
+      result.average_utilization_percentage = parseFloat(avgUtil.toFixed(2));
+    } else {
+      result.average_utilization_percentage = 0;
     }
 
-    const averageUtilization = workerCount > 0 ? totalUtilization / workerCount : 0;
-    const totalTime = totalProductiveTime + totalIdleTime;
-    const factoryUtilization = totalTime > 0 ? (totalProductiveTime / totalTime) * 100 : 0;
-    const averageProductionRate = totalProductiveTime > 0 ? (totalProduction / (totalProductiveTime / 60)) : 0;
-
-    return {
-      total_productive_time_minutes: totalProductiveTime,
-      total_idle_time_minutes: totalIdleTime,
-      total_time_minutes: totalTime,
-      total_production_count: totalProduction,
-      average_production_rate_units_per_hour: parseFloat(averageProductionRate.toFixed(2)),
-      average_utilization_percentage: parseFloat(averageUtilization.toFixed(2)),
-      factory_utilization_percentage: parseFloat(factoryUtilization.toFixed(2)),
-      active_workers: uniqueWorkers.size,
-      active_stations: uniqueStations.size,
-      total_events: allEvents.length
-    };
+    setCachedMetrics(cacheKey, result);
+    return result;
   }
 
   /**
-   * Get average confidence score for a worker
+   * Batch fetch metrics for multiple items - optimized to avoid N+1 queries
    */
-  static async getAverageConfidence(workerId, startDate, endDate) {
-    const avgResult = await Event.aggregate([
+  static async getMultipleWorkerMetrics(workerIds, startDate, endDate) {
+    const results = await Event.aggregate([
       {
         $match: {
-          worker_id: workerId,
-          timestamp: { $gte: startDate, $lte: endDate }
+          worker_id: { $in: workerIds },
+          timestamp: { $gte: startDate, $lte: endDate },
+          event_type: { $in: ['working', 'idle', 'product_count'] }
         }
       },
       {
         $group: {
-          _id: null,
-          avgConfidence: { $avg: '$confidence' }
+          _id: '$worker_id',
+          total_active_time: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'working'] }, { $ifNull: ['$duration', 1] }, 0]
+            }
+          },
+          total_idle_time: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'idle'] }, { $ifNull: ['$duration', 1] }, 0]
+            }
+          },
+          total_units_produced: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'product_count'] }, { $ifNull: ['$count', 0] }, 0]
+            }
+          },
+          working_events_count: {
+            $sum: { $cond: [{ $eq: ['$event_type', 'working'] }, 1, 0] }
+          },
+          idle_events_count: {
+            $sum: { $cond: [{ $eq: ['$event_type', 'idle'] }, 1, 0] }
+          },
+          avg_confidence: { $avg: '$confidence' }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          worker_id: '$_id',
+          total_active_time_minutes: '$total_active_time',
+          total_idle_time_minutes: '$total_idle_time',
+          total_time_minutes: { $add: ['$total_active_time', '$total_idle_time'] },
+          total_units_produced: '$total_units_produced',
+          working_events_count: '$working_events_count',
+          idle_events_count: '$idle_events_count',
+          utilization_percentage: {
+            $cond: [
+              { $gt: [{ $add: ['$total_active_time', '$total_idle_time'] }, 0] },
+              {
+                $round: [
+                  {
+                    $multiply: [
+                      { $divide: ['$total_active_time', { $add: ['$total_active_time', '$total_idle_time'] }] },
+                      100
+                    ]
+                  },
+                  2
+                ]
+              },
+              0
+            ]
+          },
+          units_per_hour: {
+            $cond: [
+              { $gt: ['$total_active_time', 0] },
+              {
+                $round: [
+                  { $divide: ['$total_units_produced', { $divide: ['$total_active_time', 60] }] },
+                  2
+                ]
+              },
+              0
+            ]
+          },
+          average_confidence: { $round: ['$avg_confidence', 3] }
         }
       }
     ]);
 
-    return avgResult.length > 0 ? parseFloat(avgResult[0].avgConfidence.toFixed(3)) : 0;
+    return results;
   }
 
   /**
-   * Get average confidence score for a workstation
+   * Batch fetch metrics for multiple workstations - optimized to avoid N+1 queries
    */
-  static async getAverageConfidenceStation(stationId, startDate, endDate) {
-    const avgResult = await Event.aggregate([
+  static async getMultipleWorkstationMetrics(stationIds, startDate, endDate) {
+    const results = await Event.aggregate([
       {
         $match: {
-          workstation_id: stationId,
-          timestamp: { $gte: startDate, $lte: endDate }
+          workstation_id: { $in: stationIds },
+          timestamp: { $gte: startDate, $lte: endDate },
+          event_type: { $in: ['working', 'idle', 'product_count'] }
         }
       },
       {
         $group: {
-          _id: null,
-          avgConfidence: { $avg: '$confidence' }
+          _id: '$workstation_id',
+          occupancy_time: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'working'] }, { $ifNull: ['$duration', 1] }, 0]
+            }
+          },
+          idle_time: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'idle'] }, { $ifNull: ['$duration', 1] }, 0]
+            }
+          },
+          total_units_produced: {
+            $sum: {
+              $cond: [{ $eq: ['$event_type', 'product_count'] }, { $ifNull: ['$count', 0] }, 0]
+            }
+          },
+          working_events_count: {
+            $sum: { $cond: [{ $eq: ['$event_type', 'working'] }, 1, 0] }
+          },
+          unique_workers: { $addToSet: '$worker_id' },
+          avg_confidence: { $avg: '$confidence' }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          station_id: '$_id',
+          occupancy_time_minutes: '$occupancy_time',
+          idle_time_minutes: '$idle_time',
+          total_time_minutes: { $add: ['$occupancy_time', '$idle_time'] },
+          total_units_produced: '$total_units_produced',
+          working_events_count: '$working_events_count',
+          unique_workers: { $size: '$unique_workers' },
+          utilization_percentage: {
+            $cond: [
+              { $gt: [{ $add: ['$occupancy_time', '$idle_time'] }, 0] },
+              {
+                $round: [
+                  {
+                    $multiply: [
+                      { $divide: ['$occupancy_time', { $add: ['$occupancy_time', '$idle_time'] }] },
+                      100
+                    ]
+                  },
+                  2
+                ]
+              },
+              0
+            ]
+          },
+          throughput_rate_units_per_hour: {
+            $cond: [
+              { $gt: ['$occupancy_time', 0] },
+              {
+                $round: [
+                  { $divide: ['$total_units_produced', { $divide: ['$occupancy_time', 60] }] },
+                  2
+                ]
+              },
+              0
+            ]
+          },
+          average_confidence: { $round: ['$avg_confidence', 3] }
         }
       }
     ]);
 
-    return avgResult.length > 0 ? parseFloat(avgResult[0].avgConfidence.toFixed(3)) : 0;
+    return results;
   }
 
   /**

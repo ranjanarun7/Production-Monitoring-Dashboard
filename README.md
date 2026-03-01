@@ -4,6 +4,10 @@ A small full‑stack reference app for monitoring a factory floor using AI‑gen
 
 This README is written to be practical for someone cloning the repo and reviewing the system, not as a whitepaper.
 
+## Live Demo
+
+- Frontend (production): https://production-monitoring-dashboard-ten.vercel.app/
+
 ---
 
 ## 1. What This Project Does
@@ -411,13 +415,13 @@ Signals you can compute off this dataset:
 - Changes in **event type distribution** (e.g. sudden spike in `idle` vs `working`).
 - Deviations in **units/hour** or **utilization** that can’t be explained by production schedules.
 
-In practice, you would run periodic jobs that:
+In practice, you would run periodic jobs that, for example:
 
 1. Compute recent confidence / event distributions for each model version.
 2. Compare them to historical baselines.
 3. Raise an alert (or change a status field) if drift in confidence or distribution crosses a threshold.
 
-The README used to include full pseudo‑implementations for these jobs; those details are straightforward to add on top of the existing schema and are omitted here to keep things readable.
+The exact implementation of those jobs depends on your infrastructure (cron jobs, Airflow, cloud schedulers, etc.), so this project just focuses on making sure the right data is stored to support them.
 
 ### 9.3 Triggering Retraining
 

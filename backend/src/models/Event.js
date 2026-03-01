@@ -50,9 +50,27 @@ const eventSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Compound index for querying worker/station events in time range
+// OPTIMIZATION: Add compound indexes for common query patterns
+// Index for worker metrics queries: worker_id + timestamp + event_type
+eventSchema.index({ worker_id: 1, timestamp: 1, event_type: 1 });
+
+// Index for workstation metrics queries: workstation_id + timestamp + event_type
+eventSchema.index({ workstation_id: 1, timestamp: 1, event_type: 1 });
+
+// Index for factory metrics queries: timestamp + event_type
+eventSchema.index({ timestamp: 1, event_type: 1 });
+
+// Index for detecting duplicates: worker_id + workstation_id + event_type + timestamp
+eventSchema.index({ worker_id: 1, workstation_id: 1, event_type: 1, timestamp: 1 });
+
+// Index for sorting events by worker and timestamp
+eventSchema.index({ worker_id: 1, timestamp: 1 });
+
+// Compound index for querying worker/station events in time range (descending for latest first)
 eventSchema.index({ worker_id: 1, timestamp: -1 });
 eventSchema.index({ workstation_id: 1, timestamp: -1 });
 eventSchema.index({ timestamp: -1, isProcessed: 1 });
 
-module.exports = mongoose.model('Event', eventSchema);
+const Event = mongoose.model('Event', eventSchema);
+
+module.exports = Event;

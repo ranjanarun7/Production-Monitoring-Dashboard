@@ -7,6 +7,36 @@ const api = axios.create({
   timeout: 30000  // 30 seconds for production (handles Render cold starts)
 });
 
+// OPTIMIZATION: Simple request deduplication cache
+const requestCache = new Map();
+const CACHE_DURATION = 5000; // 5 seconds
+
+function getCachedRequest(key) {
+  const cached = requestCache.get(key);
+  if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+    return cached.promise;
+  }
+  return null;
+}
+
+function setCachedRequest(key, promise) {
+  requestCache.set(key, { promise, timestamp: Date.now() });
+}
+
+// Middleware to deduplicate identical requests
+const requestInterceptor = (config) => {
+  const cacheKey = `${config.method}:${config.url}:${JSON.stringify(config.params || {})}`;
+  const cached = getCachedRequest(cacheKey);
+  
+  if (cached) {
+    // Return a promise that resolves to the cached response
+    return Promise.resolve({ ...config, _cached: cached });
+  }
+  return config;
+};
+
+api.interceptors.request.use(requestInterceptor);
+
 export const workerService = {
   getAll: () => api.get('/workers'),
   getById: (workerId) => api.get(`/workers/${workerId}`),

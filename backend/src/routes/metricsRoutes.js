@@ -38,40 +38,48 @@ router.get('/workstation/:station_id', async (req, res) => {
   }
 });
 
-// Get all workers metrics
+// Get all workers metrics - OPTIMIZED: Fetch all at once instead of N+1
 router.get('/workers/all', async (req, res) => {
   try {
     const Worker = require('../models/Worker');
-    const workers = await Worker.find();
+    const workers = await Worker.find().select('worker_id'); // Only fetch IDs
     const startDate = req.query.start_date ? new Date(req.query.start_date) : new Date(Date.now() - 24 * 60 * 60 * 1000);
     const endDate = req.query.end_date ? new Date(req.query.end_date) : new Date();
 
-    const metricsPromises = workers.map(w => MetricsService.getWorkerMetrics(w.worker_id, startDate, endDate));
-    const allMetrics = await Promise.all(metricsPromises);
+    // Batch fetch metrics for all workers in one aggregation
+    const metricsArray = await MetricsService.getMultipleWorkerMetrics(
+      workers.map(w => w.worker_id),
+      startDate,
+      endDate
+    );
 
     res.json({
-      count: allMetrics.length,
-      metrics: allMetrics
+      count: metricsArray.length,
+      metrics: metricsArray
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get all workstations metrics
+// Get all workstations metrics - OPTIMIZED: Fetch all at once instead of N+1
 router.get('/workstations/all', async (req, res) => {
   try {
     const Workstation = require('../models/Workstation');
-    const workstations = await Workstation.find();
+    const workstations = await Workstation.find().select('station_id'); // Only fetch IDs
     const startDate = req.query.start_date ? new Date(req.query.start_date) : new Date(Date.now() - 24 * 60 * 60 * 1000);
     const endDate = req.query.end_date ? new Date(req.query.end_date) : new Date();
 
-    const metricsPromises = workstations.map(s => MetricsService.getWorkstationMetrics(s.station_id, startDate, endDate));
-    const allMetrics = await Promise.all(metricsPromises);
+    // Batch fetch metrics for all workstations in one aggregation
+    const metricsArray = await MetricsService.getMultipleWorkstationMetrics(
+      workstations.map(s => s.station_id),
+      startDate,
+      endDate
+    );
 
     res.json({
-      count: allMetrics.length,
-      metrics: allMetrics
+      count: metricsArray.length,
+      metrics: metricsArray
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
